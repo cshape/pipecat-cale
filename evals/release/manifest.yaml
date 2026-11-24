@@ -88,6 +88,8 @@ suite:
     scenarios: [scripted/capital_question]
   - bot: voice/voice-fish.py
     scenarios: [scripted/capital_question]
+  - bot: voice/voice-fish-stt.py
+    scenarios: [scripted/capital_question]
   - bot: voice/voice-funasr.py
     scenarios: [scripted/capital_question]
   - bot: voice/voice-gladia.py

@@ -29,6 +29,7 @@ SERVICE_CONFIGS = {
     "cartesia_turns_stt": 'CartesiaTurnsSTTService(api_key=os.getenv("CARTESIA_API_KEY"))',
     "deepgram_stt": 'DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))',
     "deepgram_flux_stt": 'DeepgramFluxSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))',
+    "fish_stt": 'FishAudioSTTService(api_key=os.getenv("FISH_API_KEY"))',
     "deepgram_flux_sagemaker_stt": (
         "DeepgramFluxSageMakerSTTService(\n"
         '        endpoint_name=os.getenv("DEEPGRAM_FLUX_SAGEMAKER_STT_ENDPOINT_NAME"),\n'
