@@ -1,0 +1,1 @@
+- Added `FishAudioDrama3ExpressionAdapter`. With expressive conversation on, `FishAudioTTSService` on `drama-3` performs directions such as `[excited]`, sounds and pauses in brackets, and word-level deliveries as Drama 3's paired tags: `<whisper>`, `<soft>`, `<forceful>`, `<slow>`, `<fast>` and `<emphasis>`. On `s3-pro` it performs the S2 family's bracket tags.

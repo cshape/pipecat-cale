@@ -10,6 +10,9 @@ This module provides integration with Fish Audio's real-time TTS WebSocket API
 for streaming text-to-speech synthesis with customizable voice parameters.
 """
 
+import asyncio
+import re
+import time
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self
@@ -18,7 +21,10 @@ from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.adapters.tts.base_expression_adapter import BaseExpressionAdapter
-from pipecat.adapters.tts.services.fish_adapter import FishAudioS2ExpressionAdapter
+from pipecat.adapters.tts.services.fish_adapter import (
+    FishAudioDrama3ExpressionAdapter,
+    FishAudioS2ExpressionAdapter,
+)
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -45,6 +51,22 @@ except ModuleNotFoundError as e:
 
 # FishAudio supports various output formats
 FishAudioOutputFormat = Literal["opus", "mp3", "pcm", "wav"]
+
+# How long the latest chunk's word alignment must go without an update before
+# its last word is reported. Fish sends a growing snapshot of each chunk's
+# alignment; a word is reported once a later word follows it, and a chunk's
+# last word once the next chunk starts or after this long without a message.
+ALIGNMENT_SETTLE_SECS = 0.25
+
+# How many recent chunks keep their alignment state. Fish repeats a finished
+# chunk's alignment on the first audio of the next reply, so a chunk is kept a
+# while after it ends, to tell that repeat from a new chunk.
+_KEPT_CHUNKS = 8
+
+# A bracketed tag, such as "[excited]" or "[short pause]", which Fish Audio
+# performs and leaves out of its word alignment; angle-bracket markup, such as
+# "<whisper>", which word tracking skips by itself; and a word.
+_TEXT_TOKEN_RE = re.compile(r"\[[^\[\]]*\]|<[^<>]*>|[^\s\[<]+")
 
 
 @dataclass
@@ -105,7 +127,13 @@ class FishAudioTTSService(InterruptibleTTSService):
     audio generation with interruption handling.
 
     Uses the ``s2.1-pro`` model by default. Set ``Settings(model=...)`` to use
-    another Fish Audio model, such as ``s2-pro`` or ``drama-3``.
+    another Fish Audio model, such as ``s3-pro``, ``s2-pro`` or ``drama-3``.
+
+    By default it streams from Fish Audio's timestamped endpoint, which reports
+    when each word is spoken. The bot's words then reach the context as they are
+    heard, so an interrupted reply keeps only what the user heard. Pass
+    ``word_timestamps=False`` to use the endpoint without timestamps, which
+    reports each sentence as spoken once its audio is generated.
     """
 
     Settings = FishAudioTTSSettings
@@ -144,6 +172,7 @@ class FishAudioTTSService(InterruptibleTTSService):
         model_id: str | None = None,
         output_format: FishAudioOutputFormat = "pcm",
         sample_rate: int | None = None,
+        word_timestamps: bool = True,
         params: InputParams | None = None,
         settings: Settings | None = None,
         **kwargs,
@@ -166,6 +195,8 @@ class FishAudioTTSService(InterruptibleTTSService):
 
             output_format: Audio output format. Defaults to "pcm".
             sample_rate: Audio sample rate. If None, uses default.
+            word_timestamps: Whether to stream from Fish Audio's timestamped
+                endpoint and report each word as it is spoken. Defaults to True.
             params: Additional input parameters for voice customization.
 
                 .. deprecated:: 0.0.105
@@ -219,6 +250,7 @@ class FishAudioTTSService(InterruptibleTTSService):
             default_settings.apply_update(settings)
 
         super().__init__(
+            push_text_frames=not word_timestamps,
             push_stop_frames=True,
             push_start_frame=True,
             pause_frame_processing=True,
@@ -228,10 +260,27 @@ class FishAudioTTSService(InterruptibleTTSService):
         )
 
         self._api_key = api_key
-        self._base_url = "wss://api.fish.audio/v1/tts/live"
+        self._word_timestamps = word_timestamps
+        if word_timestamps:
+            self._base_url = "wss://api.fish.audio/v1/tts/live/with-timestamp"
+        else:
+            self._base_url = "wss://api.fish.audio/v1/tts/live"
         self._s2_expression_adapter = FishAudioS2ExpressionAdapter()
+        self._drama3_expression_adapter = FishAudioDrama3ExpressionAdapter()
         self._websocket = None
         self._receive_task = None
+        self._alignment_task = None
+
+        # Word alignment state for the open Fish session. Fish times each text
+        # chunk from the start of the session's audio; words are reported to
+        # Pipecat relative to the first audio of their audio context, which is
+        # where that context's first chunk starts.
+        self._chunks: dict[int, _ChunkAlignment] = {}
+        self._latest_chunk: int | None = None
+        self._context_audio_start: dict[str, float] = {}
+        self._context_text: dict[str, _SentText] = {}
+        self._last_alignment_time = 0.0
+        self._alignment_updated = asyncio.Event()
 
         # Init-only audio format config (not runtime-updatable).
         self._fish_sample_rate = 0  # Set in start()
@@ -246,14 +295,18 @@ class FishAudioTTSService(InterruptibleTTSService):
         return True
 
     def get_expression_adapter(self) -> BaseExpressionAdapter:
-        """The adapter for the model: S2 tags on S2 models, otherwise none.
+        """The adapter for the model: bracket tags on S2 and S3, Drama 3's directions on drama-3.
 
         Returns:
             The expression adapter for the current model.
         """
         model = self._settings.model
-        if isinstance(model, str) and model.startswith("s2"):
+        if not isinstance(model, str):
+            return super().get_expression_adapter()
+        if model.startswith("s2") or model.startswith("s3"):
             return self._s2_expression_adapter
+        if model.startswith("drama-3"):
+            return self._drama3_expression_adapter
         return super().get_expression_adapter()
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
@@ -311,12 +364,19 @@ class FishAudioTTSService(InterruptibleTTSService):
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
+        if self._word_timestamps and not self._alignment_task:
+            self._alignment_task = self.create_task(self._alignment_settle_handler())
+
     async def _disconnect(self):
         await super()._disconnect()
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
+
+        if self._alignment_task:
+            await self.cancel_task(self._alignment_task)
+            self._alignment_task = None
 
         await self._disconnect_websocket()
 
@@ -336,6 +396,7 @@ class FishAudioTTSService(InterruptibleTTSService):
                 self._base_url, additional_headers=headers, max_size=16 * 1024 * 1024
             )
             self._websocket = websocket
+            self._reset_alignment()
 
             prosody: dict[str, Any] = {
                 "speed": self._settings.prosody_speed,
@@ -408,7 +469,128 @@ class FishAudioTTSService(InterruptibleTTSService):
     async def on_audio_context_interrupted(self, context_id: str):
         """Stop all metrics when audio context is interrupted."""
         await self.stop_all_metrics()
+        self._forget_context(context_id)
         await super().on_audio_context_interrupted(context_id)
+
+    async def on_audio_context_completed(self, context_id: str):
+        """Forget the word alignment state of a context that finished playing."""
+        self._forget_context(context_id)
+        await super().on_audio_context_completed(context_id)
+
+    def _forget_context(self, context_id: str):
+        """Drop a context's alignment state; its words still to come are not reported."""
+        for chunk in self._chunks.values():
+            if chunk.context_id == context_id:
+                chunk.closed = True
+        self._context_audio_start.pop(context_id, None)
+        self._context_text.pop(context_id, None)
+
+    def _reset_alignment(self):
+        """Start the alignment clock over, for a new Fish session."""
+        self._chunks = {}
+        self._latest_chunk = None
+        self._context_audio_start = {}
+        self._alignment_updated.clear()
+
+    async def _handle_alignment(self, message: dict[str, Any], context_id: str | None):
+        """Keep a chunk's latest alignment snapshot and report the words that have settled."""
+        alignment = message.get("alignment")
+        if not alignment:
+            return
+        chunk_seq = message.get("chunk_seq")
+        if not isinstance(chunk_seq, int):
+            return
+        chunk = self._chunks.get(chunk_seq)
+        if chunk is None:
+            latest = self._latest_chunk
+            if latest is not None and chunk_seq < latest:
+                return
+            if context_id is None:
+                return
+            await self._finish_chunks_before(chunk_seq)
+            chunk_offset = float(message.get("chunk_audio_offset_sec") or 0.0)
+            chunk = _ChunkAlignment(context_id=context_id, offset=chunk_offset)
+            self._chunks[chunk_seq] = chunk
+            self._latest_chunk = chunk_seq
+            if context_id not in self._context_audio_start:
+                self._context_audio_start[context_id] = chunk_offset
+            self._prune_chunks(chunk_seq)
+        # A repeat of a finished chunk, which Fish sends with the next reply's
+        # first audio, updates that chunk: its context is where it started.
+        chunk.segments = _valid_segments(alignment.get("segments"))
+        await self._report_chunk(chunk, final=False)
+        self._last_alignment_time = time.monotonic()
+        self._alignment_updated.set()
+
+    async def _finish_chunks_before(self, chunk_seq: int):
+        """Report the remaining words of the chunks before this one, which are done."""
+        for seq in sorted(self._chunks):
+            if seq < chunk_seq:
+                await self._report_chunk(self._chunks[seq], final=True)
+
+    async def _finish_all_chunks(self):
+        """Report every word received, as the session finished or the socket closed."""
+        for seq in sorted(self._chunks):
+            await self._report_chunk(self._chunks[seq], final=True)
+
+    def _prune_chunks(self, latest: int):
+        for seq in list(self._chunks):
+            if seq <= latest - _KEPT_CHUNKS:
+                del self._chunks[seq]
+
+    async def _report_chunk(self, chunk: "_ChunkAlignment", final: bool):
+        """Report a chunk's words not reported yet, holding back the last one unless the chunk is done.
+
+        Fish can still move a chunk's last word in a later snapshot, so a word
+        is reported once a later word follows it. Each bracketed tag sent before
+        a word is reported as a word of its own, at the end of the word before it.
+        """
+        if chunk.closed:
+            return
+        settled = len(chunk.segments)
+        if not final:
+            settled = settled - 1
+        if settled <= chunk.reported:
+            return
+        new_segments = chunk.segments[chunk.reported : settled]
+        chunk.reported = settled
+        context_start = self._context_audio_start.get(chunk.context_id, chunk.offset)
+        sent_text = self._context_text.get(chunk.context_id)
+        word_times = []
+        for segment in new_segments:
+            start = chunk.offset + segment.start - context_start
+            end = chunk.offset + segment.end - context_start
+            # Fish times words to the hundredth of a second; rounding keeps
+            # float noise from the offset arithmetic out of the timestamps.
+            start = round(max(0.0, start), 3)
+            end = round(max(start, end), 3)
+            if sent_text is not None:
+                tags = sent_text.tags_before(segment.text)
+                tag_time = min(sent_text.last_end, start)
+                for tag in tags:
+                    word_times.append((tag, tag_time, tag_time))
+                sent_text.last_end = end
+            word_times.append((segment.text, start, end))
+        if word_times:
+            await self.add_word_timestamps(word_times, context_id=chunk.context_id)
+
+    async def _alignment_settle_handler(self):
+        """Report the latest chunk's last word once its alignment has gone quiet."""
+        while True:
+            await self._alignment_updated.wait()
+            self._alignment_updated.clear()
+            while True:
+                remaining = self._last_alignment_time + ALIGNMENT_SETTLE_SECS - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            latest = self._latest_chunk
+            if latest is None or latest not in self._chunks:
+                continue
+            try:
+                await self._report_chunk(self._chunks[latest], final=True)
+            except Exception as e:
+                logger.warning(f"{self}: could not report Fish Audio word timestamps: {e}")
 
     async def _receive_messages(self):
         async for message in self._get_websocket():
@@ -419,8 +601,8 @@ class FishAudioTTSService(InterruptibleTTSService):
                         event = msg.get("event")
                         if event == "audio":
                             audio_data = msg.get("audio")
+                            context_id = self.get_active_audio_context_id()
                             if audio_data:
-                                context_id = self.get_active_audio_context_id()
                                 frame = TTSAudioRawFrame(
                                     audio_data,
                                     self.sample_rate,
@@ -429,7 +611,10 @@ class FishAudioTTSService(InterruptibleTTSService):
                                 )
                                 await self.append_to_audio_context(context_id, frame)
                                 await self.stop_ttfb_metrics()
+                            if self._word_timestamps:
+                                await self._handle_alignment(msg, context_id)
                         elif event == "finish":
+                            await self._finish_all_chunks()
                             reason = msg.get("reason", "unknown")
                             if reason == "error":
                                 await self.push_error(
@@ -440,6 +625,8 @@ class FishAudioTTSService(InterruptibleTTSService):
 
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+        # The socket closed: report the words of audio already received.
+        await self._finish_all_chunks()
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
@@ -456,6 +643,13 @@ class FishAudioTTSService(InterruptibleTTSService):
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
+
+            if self._word_timestamps:
+                sent_text = self._context_text.get(context_id)
+                if sent_text is None:
+                    sent_text = _SentText()
+                    self._context_text[context_id] = sent_text
+                sent_text.add(text)
 
             # Send the text
             text_message = {
@@ -479,3 +673,114 @@ class FishAudioTTSService(InterruptibleTTSService):
 
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
+
+
+@dataclass
+class _Segment:
+    """One word of Fish Audio's alignment, timed from the start of its chunk."""
+
+    text: str
+    start: float
+    end: float
+
+
+@dataclass
+class _ChunkAlignment:
+    """A text chunk's latest alignment snapshot, and how many of its words were reported."""
+
+    context_id: str
+    offset: float
+    segments: list[_Segment] = field(default_factory=list)
+    reported: int = 0
+    closed: bool = False
+
+
+def _valid_segments(raw: Any) -> list[_Segment]:
+    """The timed words of an alignment snapshot, skipping malformed entries."""
+    segments = []
+    if not isinstance(raw, list):
+        return segments
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        start = item.get("start")
+        end = item.get("end")
+        if not text or not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            continue
+        segments.append(_Segment(text=str(text), start=float(start), end=float(end)))
+    return segments
+
+
+def _word_key(text: str) -> str:
+    """A word's letters and digits, lowercased, for matching reported words to sent ones."""
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+class _SentText:
+    """The words and bracketed tags sent for one audio context, in order.
+
+    Fish Audio reports the words it speaks but not the bracketed tags it
+    performs. Word tracking expects every tag before a word to be reported as a
+    word of its own, so each reported word is matched against the text sent,
+    and the tags passed over on the way are handed back to report before it.
+    """
+
+    # How many sent words a reported word may skip to find its match.
+    LOOKAHEAD_WORDS = 4
+
+    def __init__(self):
+        self._tokens: list[tuple[str, str]] = []
+        self._position = 0
+        self._partial = ""
+        self.last_end = 0.0
+
+    def add(self, text: str):
+        for match in _TEXT_TOKEN_RE.finditer(text):
+            token = match.group(0)
+            if token.startswith("["):
+                self._tokens.append(("tag", token))
+            elif token.startswith("<"):
+                continue
+            else:
+                key = _word_key(token)
+                if key:
+                    self._tokens.append(("word", key))
+
+    def tags_before(self, word: str) -> list[str]:
+        """The tags sent before this reported word, and moves past it."""
+        key = _word_key(word)
+        if not key:
+            return []
+        if self._partial:
+            # Fish reported part of a sent word; this may be the rest of it.
+            expected = self._tokens[self._position][1]
+            joined = self._partial + key
+            if expected.startswith(joined):
+                self._partial = joined
+                if joined == expected:
+                    self._partial = ""
+                    self._position += 1
+                return []
+            self._partial = ""
+            self._position += 1
+        tags = []
+        words_seen = 0
+        index = self._position
+        while index < len(self._tokens) and words_seen < self.LOOKAHEAD_WORDS:
+            kind, value = self._tokens[index]
+            if kind == "tag":
+                tags.append(value)
+                index += 1
+                continue
+            words_seen += 1
+            if value == key:
+                self._position = index + 1
+                return tags
+            if value.startswith(key):
+                self._partial = key
+                self._position = index
+                return tags
+            index += 1
+        # No sent word matches: report the word alone and stay in place.
+        return []

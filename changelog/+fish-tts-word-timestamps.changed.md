@@ -1,0 +1,2 @@
+- `FishAudioTTSService` now streams from Fish Audio's timestamped endpoint (`/v1/tts/live/with-timestamp`) and reports each word as it is spoken. An interrupted reply now keeps only the words the user heard in the context, where before it kept every sentence whose audio had been generated. Pass `word_timestamps=False` to use `/v1/tts/live` as before.
+- `FishAudioS2ExpressionAdapter` sets its tags apart from the words with spaces, so word timestamps line up with the text.
