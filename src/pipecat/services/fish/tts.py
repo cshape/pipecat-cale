@@ -543,17 +543,18 @@ class FishAudioTTSService(InterruptibleTTSService):
 
         Fish can still move a chunk's last word in a later snapshot, so a word
         is reported once a later word follows it. Each bracketed tag sent before
-        a word is reported as a word of its own, at the end of the word before it.
+        a word is reported as a word of its own, at the end of the word before it,
+        and a sent word Fish speaks in pieces is reported once, as it was sent.
         """
         if chunk.closed:
             return
         settled = len(chunk.segments)
         if not final:
             settled = settled - 1
-        if settled <= chunk.reported:
-            return
-        new_segments = chunk.segments[chunk.reported : settled]
-        chunk.reported = settled
+        new_segments = []
+        if settled > chunk.reported:
+            new_segments = chunk.segments[chunk.reported : settled]
+            chunk.reported = settled
         context_start = self._context_audio_start.get(chunk.context_id, chunk.offset)
         sent_text = self._context_text.get(chunk.context_id)
         word_times = []
@@ -564,13 +565,15 @@ class FishAudioTTSService(InterruptibleTTSService):
             # float noise from the offset arithmetic out of the timestamps.
             start = round(max(0.0, start), 3)
             end = round(max(start, end), 3)
-            if sent_text is not None:
-                tags = sent_text.tags_before(segment.text)
-                tag_time = min(sent_text.last_end, start)
-                for tag in tags:
-                    word_times.append((tag, tag_time, tag_time))
-                sent_text.last_end = end
-            word_times.append((segment.text, start, end))
+            if sent_text is None:
+                word_times.append((segment.text, start, end))
+                continue
+            placed = sent_text.place(segment.text, start, end)
+            word_times.extend(placed)
+        if final and sent_text is not None:
+            # A sent word never splits across chunks, so its pieces end here.
+            unfinished = sent_text.finish_word()
+            word_times.extend(unfinished)
         if word_times:
             await self.add_word_timestamps(word_times, context_id=chunk.context_id)
 
@@ -717,70 +720,158 @@ def _word_key(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
+@dataclass
+class _SentToken:
+    """One bracketed tag or one word of the text sent for an audio context.
+
+    Parameters:
+        text: The tag, or the word as it was sent.
+        key: A word's letters and digits, lowercased; empty for a tag.
+    """
+
+    text: str
+    key: str = ""
+
+    @property
+    def is_tag(self) -> bool:
+        return not self.key
+
+
 class _SentText:
     """The words and bracketed tags sent for one audio context, in order.
 
     Fish Audio reports the words it speaks but not the bracketed tags it
-    performs. Word tracking expects every tag before a word to be reported as a
-    word of its own, so each reported word is matched against the text sent,
-    and the tags passed over on the way are handed back to report before it.
+    performs, and it reports some sent words in pieces ("$42.50" as "42" and
+    "50"). Word tracking expects every tag before a word to be reported as a
+    word of its own, and pieces reported apart would reach the conversation
+    context with spaces inside the word. So each word Fish reports is matched
+    against the text sent: the tags passed over on the way are reported before
+    it, and the pieces of one sent word are reported once, as the word sent.
     """
 
     # How many sent words a reported word may skip to find its match.
     LOOKAHEAD_WORDS = 4
 
     def __init__(self):
-        self._tokens: list[tuple[str, str]] = []
+        self._tokens: list[_SentToken] = []
         self._position = 0
-        self._partial = ""
-        self.last_end = 0.0
+        # The pieces Fish has reported of the sent word at _position.
+        self._pieces_key = ""
+        self._pieces_start = 0.0
+        self._pieces_end = 0.0
+        # A sent word reported before Fish spoke all of it, and the pieces spoken so far.
+        self._early_word: _SentToken | None = None
+        self._early_key = ""
+        self._last_end = 0.0
 
     def add(self, text: str):
         for match in _TEXT_TOKEN_RE.finditer(text):
             token = match.group(0)
             if token.startswith("["):
-                self._tokens.append(("tag", token))
-            elif token.startswith("<"):
+                self._tokens.append(_SentToken(text=token))
                 continue
-            else:
-                key = _word_key(token)
-                if key:
-                    self._tokens.append(("word", key))
+            if token.startswith("<"):
+                continue
+            key = _word_key(token)
+            if key:
+                self._tokens.append(_SentToken(text=token, key=key))
 
-    def tags_before(self, word: str) -> list[str]:
-        """The tags sent before this reported word, and moves past it."""
+    def place(self, word: str, start: float, end: float) -> list[tuple[str, float, float]]:
+        """What to report for a word Fish spoke: the tags sent before it, then the word.
+
+        Each tag is timed at the end of the word before it. Nothing is returned
+        for a piece of a sent word until Fish has spoken all of it.
+        """
+        reported = []
         key = _word_key(word)
+        if self._continues_early_word(key):
+            self._last_end = end
+            return reported
+        if self._pieces_key:
+            sent_word = self._tokens[self._position]
+            joined = self._pieces_key + key
+            if key and sent_word.key.startswith(joined):
+                self._pieces_key = joined
+                self._pieces_end = end
+                if joined == sent_word.key:
+                    finished = self._finish_pieces()
+                    reported.append(finished)
+                self._last_end = end
+                return reported
+            # Fish moved on before speaking all of the sent word.
+            finished = self._finish_pieces()
+            reported.append(finished)
         if not key:
+            reported.append((word, start, end))
+            self._last_end = end
+            return reported
+        index, tags = self._find(key)
+        if index is None:
+            # No sent word matches: report the word alone and stay in place.
+            reported.append((word, start, end))
+            self._last_end = end
+            return reported
+        tag_time = min(self._last_end, start)
+        for tag in tags:
+            reported.append((tag, tag_time, tag_time))
+        sent_word = self._tokens[index]
+        if sent_word.key == key:
+            self._position = index + 1
+            reported.append((word, start, end))
+        else:
+            self._position = index
+            self._pieces_key = key
+            self._pieces_start = start
+            self._pieces_end = end
+        self._last_end = end
+        return reported
+
+    def finish_word(self) -> list[tuple[str, float, float]]:
+        """Report the sent word Fish has spoken only part of, if any, as that word.
+
+        Pieces of it Fish reports afterwards are taken as part of it, not reported again.
+        """
+        if not self._pieces_key:
             return []
-        if self._partial:
-            # Fish reported part of a sent word; this may be the rest of it.
-            expected = self._tokens[self._position][1]
-            joined = self._partial + key
-            if expected.startswith(joined):
-                self._partial = joined
-                if joined == expected:
-                    self._partial = ""
-                    self._position += 1
-                return []
-            self._partial = ""
-            self._position += 1
+        self._early_word = self._tokens[self._position]
+        self._early_key = self._pieces_key
+        finished = self._finish_pieces()
+        return [finished]
+
+    def _continues_early_word(self, key: str) -> bool:
+        """Whether key is more of the sent word finish_word reported early."""
+        if self._early_word is None:
+            return False
+        joined = self._early_key + key
+        if not key or not self._early_word.key.startswith(joined):
+            self._early_word = None
+            return False
+        self._early_key = joined
+        if joined == self._early_word.key:
+            self._early_word = None
+        return True
+
+    def _find(self, key: str) -> tuple[int | None, list[str]]:
+        """The next sent word that starts with key, within the lookahead, and the tags before it."""
         tags = []
         words_seen = 0
         index = self._position
         while index < len(self._tokens) and words_seen < self.LOOKAHEAD_WORDS:
-            kind, value = self._tokens[index]
-            if kind == "tag":
-                tags.append(value)
+            token = self._tokens[index]
+            if token.is_tag:
+                tags.append(token.text)
                 index += 1
                 continue
             words_seen += 1
-            if value == key:
-                self._position = index + 1
-                return tags
-            if value.startswith(key):
-                self._partial = key
-                self._position = index
-                return tags
+            if token.key.startswith(key):
+                return index, tags
             index += 1
-        # No sent word matches: report the word alone and stay in place.
-        return []
+        return None, []
+
+    def _finish_pieces(self) -> tuple[str, float, float]:
+        sent_word = self._tokens[self._position]
+        self._position += 1
+        self._pieces_key = ""
+        # Fish reports words without their trailing punctuation.
+        spelling = sent_word.text.rstrip(".,!?;:")
+        return (spelling, self._pieces_start, self._pieces_end)

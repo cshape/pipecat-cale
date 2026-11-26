@@ -435,6 +435,31 @@ async def test_a_quiet_chunk_reports_its_last_word(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_rest_of_a_word_reported_while_quiet_is_not_reported_again(monkeypatch):
+    monkeypatch.setattr(fish_tts, "ALIGNMENT_SETTLE_SECS", 0.01)
+    recorder = _Recorder()
+    sent = fish_tts._SentText()
+    sent.add("It costs $42.50 today.")
+    recorder.service._context_text["ctx"] = sent
+    first = [("It", 0.0, 0.1), ("costs", 0.1, 0.5), ("42", 0.5, 1.0)]
+    later = [*first, ("50", 1.0, 1.6), ("today", 1.7, 2.1)]
+
+    settle = asyncio.create_task(recorder.service._alignment_settle_handler())
+    await recorder.receive(_audio(0, 0.0, first), "ctx")
+    await asyncio.sleep(0.05)
+    await recorder.receive(_audio(0, 0.0, later), "ctx")
+    await asyncio.sleep(0.05)
+    settle.cancel()
+
+    assert recorder.words() == [
+        ("ctx", "It"),
+        ("ctx", "costs"),
+        ("ctx", "$42.50"),
+        ("ctx", "today"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_malformed_segments_are_skipped():
     recorder = _Recorder()
     message = ormsgpack.packb(
@@ -483,12 +508,53 @@ def test_sent_text_follows_a_word_fish_splits_or_skips():
     sent = fish_tts._SentText()
     sent.add("Say MOO-ee-toh [laugh] now.")
 
-    assert sent.tags_before("Say") == []
-    assert sent.tags_before("MOO") == []
-    assert sent.tags_before("ee") == []
-    assert sent.tags_before("toh") == []
-    assert sent.tags_before("unknown") == []
-    assert sent.tags_before("now") == ["[laugh]"]
+    assert sent.place("Say", 0.0, 0.2) == [("Say", 0.0, 0.2)]
+    assert sent.place("MOO", 0.2, 0.4) == []
+    assert sent.place("ee", 0.4, 0.5) == []
+    assert sent.place("toh", 0.5, 0.7) == [("MOO-ee-toh", 0.2, 0.7)]
+    assert sent.place("unknown", 0.7, 0.8) == [("unknown", 0.7, 0.8)]
+    assert sent.place("now", 1.2, 1.4) == [("[laugh]", 0.8, 0.8), ("now", 1.2, 1.4)]
+
+
+def test_sent_text_reports_a_word_fish_leaves_unfinished_as_the_word_sent():
+    sent = fish_tts._SentText()
+    sent.add("Call 555-0199, or e-mail me.")
+
+    assert sent.place("Call", 0.0, 0.3) == [("Call", 0.0, 0.3)]
+    assert sent.place("555", 0.3, 0.8) == []
+    # Fish moves on without the rest of the number.
+    assert sent.place("or", 1.2, 1.3) == [("555-0199", 0.3, 0.8), ("or", 1.2, 1.3)]
+    assert sent.place("e", 1.3, 1.4) == []
+    assert sent.finish_word() == [("e-mail", 1.3, 1.4)]
+    assert sent.finish_word() == []
+
+
+@pytest.mark.asyncio
+async def test_a_word_fish_reports_in_pieces_is_reported_once():
+    recorder = _Recorder()
+    sent = fish_tts._SentText()
+    sent.add("It costs $42.50, at 3:30pm.")
+    recorder.service._context_text["ctx"] = sent
+    words = [
+        ("It", 0.0, 0.1),
+        ("costs", 0.1, 0.5),
+        ("42", 0.5, 1.0),
+        ("50", 1.0, 1.6),
+        ("at", 1.7, 1.8),
+        ("3", 1.8, 2.0),
+        ("30pm", 2.0, 2.6),
+    ]
+
+    await recorder.receive(_audio(0, 0.0, words), "ctx")
+    await recorder.service._finish_all_chunks()
+
+    assert recorder.reported == [
+        ("ctx", "It", 0.0, 0.1),
+        ("ctx", "costs", 0.1, 0.5),
+        ("ctx", "$42.50", 0.5, 1.6),
+        ("ctx", "at", 1.7, 1.8),
+        ("ctx", "3:30pm", 1.8, 2.6),
+    ]
 
 
 def test_without_word_timestamps_the_plain_endpoint_reports_no_words():
@@ -498,8 +564,11 @@ def test_without_word_timestamps_the_plain_endpoint_reports_no_words():
     assert service._push_text_frames is True
 
 
-async def _context_after_speaking(adapter, llm_text):
-    """Format llm_text as the service sends it, report Fish's words for it, return the context text."""
+async def _context_after_speaking(adapter, llm_text, fish_words=None):
+    """Format llm_text as the service sends it, report Fish's words for it, return the context text.
+
+    fish_words are the words Fish reports; by default, the sent words without tags or punctuation.
+    """
     from pipecat.expressive.formatter import EXPRESSION_TAG_PATTERN, ExpressionFormatter
     from pipecat.frames.frames import AggregatedTextFrame, TTSTextFrame
     from pipecat.utils.context.aggregated_frame_sequencer import AggregatedFrameSequencer
@@ -527,24 +596,31 @@ async def _context_after_speaking(adapter, llm_text):
     # Fish reports the words it spoke, without tags or punctuation.
     tracked = fish_tts._SentText()
     tracked.add(sent_text)
-    without_tags = fish_tts._TEXT_TOKEN_RE.findall(sent_text)
-    spoken = []
-    for token in without_tags:
-        if token.startswith("[") or token.startswith("<"):
-            continue
-        word = token.strip(".,!?;:")
-        if word:
-            spoken.append(word)
+    spoken = fish_words
+    if spoken is None:
+        spoken = []
+        for token in fish_tts._TEXT_TOKEN_RE.findall(sent_text):
+            if token.startswith("[") or token.startswith("<"):
+                continue
+            word = token.strip(".,!?;:")
+            if word:
+                spoken.append(word)
+
+    reported = []
+    for word in spoken:
+        placed = tracked.place(word, 0.0, 0.0)
+        reported.extend(placed)
+    unfinished = tracked.finish_word()
+    reported.extend(unfinished)
 
     context = []
     pts = 1
-    for word in spoken:
-        reported = [*tracked.tags_before(word), word]
-        for item in reported:
-            for out in sequencer.process_word(item, pts, "ctx"):
-                if isinstance(out, TTSTextFrame) and out.append_to_context:
-                    context.append(out.raw_text if out.raw_text is not None else out.text)
-            pts += 1
+    for item in reported:
+        text = item[0]
+        for out in sequencer.process_word(text, pts, "ctx"):
+            if isinstance(out, TTSTextFrame) and out.append_to_context:
+                context.append(out.raw_text if out.raw_text is not None else out.text)
+        pts += 1
     joined = " ".join(context)
     return " ".join(joined.split()), sent_text
 
@@ -594,3 +670,38 @@ async def test_reported_words_rebuild_the_context_as_the_llm_wrote_it(adapter_cl
         if expected.endswith(trailing) and not context.endswith(trailing):
             expected = expected[: -len(trailing)]
     assert context == expected, f"sent {sent_text!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapter_class", [FishAudioDrama3ExpressionAdapter, FishAudioS2ExpressionAdapter]
+)
+async def test_words_fish_reports_in_pieces_reach_the_context_whole(adapter_class):
+    # The words Fish Audio reported for this text.
+    llm_text = (
+        "It costs $42.50, or 3:30pm on 12/25. Email bob@example.com, okay? <<happy>> C++ e-mail!"
+    )
+    fish_words = [
+        "It",
+        "costs",
+        "42",
+        "50",
+        "or",
+        "3",
+        "30pm",
+        "on",
+        "12",
+        "25",
+        "Email",
+        "bob",
+        "example",
+        "com",
+        "okay",
+        "C",
+        "e",
+        "mail",
+    ]
+
+    context, sent_text = await _context_after_speaking(adapter_class(), llm_text, fish_words)
+
+    assert context == llm_text, f"sent {sent_text!r}"
